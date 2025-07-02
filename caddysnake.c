@@ -1222,3 +1222,332 @@ exception:
   PyConfig_Clear(&config);
   Py_ExitStatusException(status);
 }
+
+// Shared Memory Communication Implementation
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <signal.h>
+
+// Message queue operations
+int enqueue_message(spsc_queue_t *q, const Message *msg) {
+    size_t next_tail = (q->tail + 1) % SHM_QUEUE_SIZE;
+    if (next_tail == q->head) {
+        return 0; // Queue is full
+    }
+    memcpy(q->data[q->tail], msg, SHM_MSG_SIZE);
+    __sync_synchronize();
+    q->tail = next_tail;
+    return 1;
+}
+
+int dequeue_message(spsc_queue_t *q, Message *msg) {
+    if (q->head == q->tail) {
+        return 0; // Queue is empty
+    }
+    memcpy(msg, q->data[q->head], SHM_MSG_SIZE);
+    __sync_synchronize();
+    q->head = (q->head + 1) % SHM_QUEUE_SIZE;
+    return 1;
+}
+
+// Create shared memory segment for worker communication
+static int create_worker_shm(uint32_t worker_id, int is_request, spsc_queue_t **queue, int *shm_fd) {
+    char shm_name[256];
+    snprintf(shm_name, sizeof(shm_name), "/caddysnake_worker_%u_%s", 
+             worker_id, is_request ? "req" : "resp");
+    
+    *shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
+    if (*shm_fd < 0) {
+        return -1;
+    }
+    
+    if (ftruncate(*shm_fd, sizeof(spsc_queue_t)) != 0) {
+        close(*shm_fd);
+        shm_unlink(shm_name);
+        return -1;
+    }
+    
+    *queue = mmap(NULL, sizeof(spsc_queue_t), PROT_READ | PROT_WRITE, MAP_SHARED, *shm_fd, 0);
+    if (*queue == MAP_FAILED) {
+        close(*shm_fd);
+        shm_unlink(shm_name);
+        return -1;
+    }
+    
+    // Initialize queue
+    memset(*queue, 0, sizeof(spsc_queue_t));
+    return 0;
+}
+
+// Clean up shared memory segment
+static void cleanup_worker_shm(uint32_t worker_id, int is_request, spsc_queue_t *queue, int shm_fd) {
+    char shm_name[256];
+    snprintf(shm_name, sizeof(shm_name), "/caddysnake_worker_%u_%s", 
+             worker_id, is_request ? "req" : "resp");
+    
+    if (queue && queue != MAP_FAILED) {
+        munmap(queue, sizeof(spsc_queue_t));
+    }
+    if (shm_fd >= 0) {
+        close(shm_fd);
+        shm_unlink(shm_name);
+    }
+}
+
+// Worker Pool Management
+WorkerPool* worker_pool_create(uint32_t num_workers, const char *module_name, 
+                              const char *app_name, const char *working_dir, 
+                              const char *venv_path, int is_asgi) {
+    if (num_workers > MAX_WORKERS) {
+        return NULL;
+    }
+    
+    WorkerPool *pool = malloc(sizeof(WorkerPool));
+    if (!pool) {
+        return NULL;
+    }
+    
+    pool->num_workers = num_workers;
+    pool->next_worker = 0;
+    
+    // Create worker processes
+    for (uint32_t i = 0; i < num_workers; i++) {
+        WorkerContext *worker = &pool->workers[i];
+        worker->worker_id = i;
+        
+        // Create shared memory segments for this worker
+        if (create_worker_shm(i, 1, &worker->request_queue, &worker->shm_fd_req) != 0) {
+            // Cleanup on failure
+            for (uint32_t j = 0; j < i; j++) {
+                cleanup_worker_shm(j, 1, pool->workers[j].request_queue, pool->workers[j].shm_fd_req);
+                cleanup_worker_shm(j, 0, pool->workers[j].response_queue, pool->workers[j].shm_fd_resp);
+                if (pool->workers[j].worker_pid > 0) {
+                    kill(pool->workers[j].worker_pid, SIGTERM);
+                    waitpid(pool->workers[j].worker_pid, NULL, 0);
+                }
+            }
+            free(pool);
+            return NULL;
+        }
+        
+        if (create_worker_shm(i, 0, &worker->response_queue, &worker->shm_fd_resp) != 0) {
+            cleanup_worker_shm(i, 1, worker->request_queue, worker->shm_fd_req);
+            for (uint32_t j = 0; j < i; j++) {
+                cleanup_worker_shm(j, 1, pool->workers[j].request_queue, pool->workers[j].shm_fd_req);
+                cleanup_worker_shm(j, 0, pool->workers[j].response_queue, pool->workers[j].shm_fd_resp);
+                if (pool->workers[j].worker_pid > 0) {
+                    kill(pool->workers[j].worker_pid, SIGTERM);
+                    waitpid(pool->workers[j].worker_pid, NULL, 0);
+                }
+            }
+            free(pool);
+            return NULL;
+        }
+        
+        // Fork worker process
+        worker->worker_pid = fork();
+        if (worker->worker_pid == 0) {
+            // Child process: start Python worker
+            char shm_req_name[256], shm_resp_name[256];
+            snprintf(shm_req_name, sizeof(shm_req_name), "/caddysnake_worker_%u_req", i);
+            snprintf(shm_resp_name, sizeof(shm_resp_name), "/caddysnake_worker_%u_resp", i);
+            
+            python_worker_main(i, shm_req_name, shm_resp_name, module_name, 
+                             app_name, working_dir, venv_path, is_asgi);
+            exit(0);
+        } else if (worker->worker_pid < 0) {
+            cleanup_worker_shm(i, 1, worker->request_queue, worker->shm_fd_req);
+            cleanup_worker_shm(i, 0, worker->response_queue, worker->shm_fd_resp);
+            for (uint32_t j = 0; j < i; j++) {
+                cleanup_worker_shm(j, 1, pool->workers[j].request_queue, pool->workers[j].shm_fd_req);
+                cleanup_worker_shm(j, 0, pool->workers[j].response_queue, pool->workers[j].shm_fd_resp);
+                if (pool->workers[j].worker_pid > 0) {
+                    kill(pool->workers[j].worker_pid, SIGTERM);
+                    waitpid(pool->workers[j].worker_pid, NULL, 0);
+                }
+            }
+            free(pool);
+            return NULL;
+        }
+    }
+    
+    return pool;
+}
+
+void worker_pool_destroy(WorkerPool *pool) {
+    if (!pool) {
+        return;
+    }
+    
+    // Send shutdown messages to all workers
+    Message shutdown_msg = {0};
+    shutdown_msg.type = MSG_TYPE_SHUTDOWN;
+    
+    for (uint32_t i = 0; i < pool->num_workers; i++) {
+        WorkerContext *worker = &pool->workers[i];
+        
+        // Send shutdown message
+        while (!enqueue_message(worker->request_queue, &shutdown_msg)) {
+            usleep(1000); // Wait 1ms and retry
+        }
+        
+        // Wait for worker to exit
+        if (worker->worker_pid > 0) {
+            waitpid(worker->worker_pid, NULL, 0);
+        }
+        
+        // Clean up shared memory
+        cleanup_worker_shm(i, 1, worker->request_queue, worker->shm_fd_req);
+        cleanup_worker_shm(i, 0, worker->response_queue, worker->shm_fd_resp);
+    }
+    
+    free(pool);
+}
+
+int worker_pool_send_request(WorkerPool *pool, Message *msg) {
+    if (!pool || pool->num_workers == 0) {
+        return -1;
+    }
+    
+    // Round-robin worker selection
+    uint32_t worker_id = pool->next_worker % pool->num_workers;
+    pool->next_worker++;
+    
+    WorkerContext *worker = &pool->workers[worker_id];
+    msg->worker_id = worker_id;
+    
+    // Try to enqueue message
+    while (!enqueue_message(worker->request_queue, msg)) {
+        usleep(100); // Wait 100μs and retry
+    }
+    
+    return worker_id;
+}
+
+int worker_pool_receive_response(WorkerPool *pool, uint32_t worker_id, Message *msg) {
+    if (!pool || worker_id >= pool->num_workers) {
+        return -1;
+    }
+    
+    WorkerContext *worker = &pool->workers[worker_id];
+    
+    // Try to dequeue response
+    while (!dequeue_message(worker->response_queue, msg)) {
+        usleep(100); // Wait 100μs and retry
+    }
+    
+    return 0;
+}
+
+// Python worker process main function
+void python_worker_main(uint32_t worker_id, const char *shm_req_name, 
+                       const char *shm_resp_name, const char *module_name,
+                       const char *app_name, const char *working_dir, 
+                       const char *venv_path, int is_asgi) {
+    
+    // Open shared memory segments
+    int shm_fd_req = shm_open(shm_req_name, O_RDWR, 0600);
+    int shm_fd_resp = shm_open(shm_resp_name, O_RDWR, 0600);
+    
+    if (shm_fd_req < 0 || shm_fd_resp < 0) {
+        exit(1);
+    }
+    
+    spsc_queue_t *request_queue = mmap(NULL, sizeof(spsc_queue_t), 
+                                      PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_req, 0);
+    spsc_queue_t *response_queue = mmap(NULL, sizeof(spsc_queue_t), 
+                                       PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_resp, 0);
+    
+    if (request_queue == MAP_FAILED || response_queue == MAP_FAILED) {
+        exit(1);
+    }
+    
+    // Initialize Python interpreter
+    PyStatus status;
+    PyConfig config;
+    PyConfig_InitPythonConfig(&config);
+    status = PyConfig_SetString(&config, &config.program_name, L"caddysnake_worker");
+    if (PyStatus_Exception(status)) {
+        exit(1);
+    }
+    status = Py_InitializeFromConfig(&config);
+    if (PyStatus_Exception(status)) {
+        exit(1);
+    }
+    PyConfig_Clear(&config);
+    
+    // Setup Python environment
+    PyObject *sysPath = PySys_GetObject("path");
+    PyList_Insert(sysPath, 0, PyUnicode_FromString(""));
+    
+    if (working_dir) {
+        PyList_Append(sysPath, PyUnicode_FromString(working_dir));
+    }
+    if (venv_path) {
+        PyList_Append(sysPath, PyUnicode_FromString(venv_path));
+    }
+    
+    // Import and initialize app
+    PyObject *module = PyImport_ImportModule(module_name);
+    if (!module) {
+        PyErr_Print();
+        exit(1);
+    }
+    
+    PyObject *app_handler = PyObject_GetAttrString(module, app_name);
+    if (!app_handler || !PyCallable_Check(app_handler)) {
+        PyErr_Print();
+        exit(1);
+    }
+    
+    // Worker message loop
+    Message msg;
+    while (1) {
+        // Wait for request message
+        while (!dequeue_message(request_queue, &msg)) {
+            usleep(1000); // Wait 1ms
+        }
+        
+        if (msg.type == MSG_TYPE_SHUTDOWN) {
+            break;
+        }
+        
+        // Process request based on type
+        Message response = {0};
+        response.request_id = msg.request_id;
+        response.worker_id = worker_id;
+        
+        if (is_asgi) {
+            response.type = MSG_TYPE_ASGI_RESPONSE;
+            // Basic ASGI response - for now just return a simple JSON response
+            const char *json_response = "{\"type\":\"http.response.start\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain\"]]}\n{\"type\":\"http.response.body\",\"body\":\"Hello from ASGI worker!\"}";
+            strncpy(response.data, json_response, sizeof(response.data) - 1);
+            response.data_size = strlen(response.data);
+        } else {
+            response.type = MSG_TYPE_WSGI_RESPONSE;
+            // Basic WSGI response - return a simple JSON response
+            const char *json_response = "{\"status\":200,\"headers\":{\"Content-Type\":\"text/plain\"},\"body\":\"Hello from WSGI worker!\"}";
+            strncpy(response.data, json_response, sizeof(response.data) - 1);
+            response.data_size = strlen(response.data);
+        }
+        
+        // Send response
+        while (!enqueue_message(response_queue, &response)) {
+            usleep(100); // Wait 100μs and retry
+        }
+    }
+    
+    // Cleanup
+    Py_XDECREF(app_handler);
+    Py_XDECREF(module);
+    Py_Finalize();
+    
+    munmap(request_queue, sizeof(spsc_queue_t));
+    munmap(response_queue, sizeof(spsc_queue_t));
+    close(shm_fd_req);
+    close(shm_fd_resp);
+}

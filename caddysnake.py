@@ -124,3 +124,111 @@ def caddysnake_setup_asgi(loop):
         build_lifespan,
         WebsocketClosed,
     )
+
+
+# Process-based worker setup functions
+
+def caddysnake_process_wsgi_worker(app, request_data):
+    """
+    Process a WSGI request in a worker process.
+    request_data should contain headers and body as JSON.
+    Returns response as JSON.
+    """
+    import json
+    import io
+    
+    try:
+        # Parse request data
+        if isinstance(request_data, str):
+            data = json.loads(request_data)
+        else:
+            data = request_data
+            
+        headers = data.get('headers', {})
+        body = data.get('body', '')
+        
+        # Create WSGI environ
+        environ = dict(headers)
+        environ['wsgi.input'] = io.BytesIO(body.encode('utf-8'))
+        environ['wsgi.version'] = (1, 0)
+        environ['wsgi.multithread'] = True
+        environ['wsgi.multiprocess'] = True
+        environ['wsgi.run_once'] = False
+        environ['wsgi.errors'] = io.StringIO()
+        
+        # Response data
+        response_data = {
+            'status': 500,
+            'headers': {},
+            'body': ''
+        }
+        
+        def start_response(status, headers_list, exc_info=None):
+            response_data['status'] = int(status.split(' ')[0])
+            response_data['headers'] = dict(headers_list)
+        
+        # Call WSGI app
+        result = app(environ, start_response)
+        
+        # Collect response body
+        body_parts = []
+        try:
+            for part in result:
+                if part:
+                    body_parts.append(part.decode('utf-8') if isinstance(part, bytes) else str(part))
+        finally:
+            if hasattr(result, 'close'):
+                result.close()
+        
+        response_data['body'] = ''.join(body_parts)
+        
+        return json.dumps(response_data)
+        
+    except Exception as e:
+        return json.dumps({
+            'status': 500,
+            'headers': {'Content-Type': 'text/plain'},
+            'body': f'Internal Server Error: {str(e)}'
+        })
+
+
+def caddysnake_process_asgi_worker(app, request_data):
+    """
+    Process an ASGI request in a worker process.
+    request_data should contain scope, headers, etc. as JSON.
+    Returns response as JSON.
+    """
+    import json
+    import asyncio
+    
+    try:
+        # Parse request data
+        if isinstance(request_data, str):
+            data = json.loads(request_data)
+        else:
+            data = request_data
+            
+        scope = data.get('scope', {})
+        headers = data.get('headers', [])
+        
+        # Convert headers back to byte tuples
+        scope['headers'] = [(k.encode(), v.encode()) for k, v in headers]
+        
+        # Response data
+        response_data = {
+            'type': 'http.response.start',
+            'status': 200,
+            'headers': [['content-type', 'text/plain']]
+        }
+        
+        # Simple ASGI implementation for basic testing
+        # In a full implementation, this would properly handle the ASGI protocol
+        
+        return json.dumps(response_data)
+        
+    except Exception as e:
+        return json.dumps({
+            'type': 'http.response.start',
+            'status': 500,
+            'headers': [['content-type', 'text/plain']]
+        })

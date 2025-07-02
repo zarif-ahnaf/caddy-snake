@@ -17,6 +17,67 @@ typedef struct {
 MapKeyVal *MapKeyVal_new(size_t);
 void MapKeyVal_free(MapKeyVal *map);
 
+// Shared Memory Communication Structures
+#define SHM_MSG_SIZE (1 << 20)  // 1MB per message
+#define SHM_QUEUE_SIZE 128      // Number of slots in each queue
+#define MAX_WORKERS 16
+
+typedef enum {
+    MSG_TYPE_WSGI_REQUEST = 1,
+    MSG_TYPE_WSGI_RESPONSE = 2,
+    MSG_TYPE_ASGI_REQUEST = 3,
+    MSG_TYPE_ASGI_RESPONSE = 4,
+    MSG_TYPE_ASGI_EVENT = 5,
+    MSG_TYPE_SHUTDOWN = 99
+} MessageType;
+
+typedef struct {
+    size_t head;
+    size_t tail;
+    uint8_t data[SHM_QUEUE_SIZE][SHM_MSG_SIZE];
+} spsc_queue_t;
+
+typedef struct {
+    MessageType type;
+    uint64_t request_id;
+    uint32_t worker_id;
+    uint32_t data_size;
+    char data[SHM_MSG_SIZE - sizeof(MessageType) - sizeof(uint64_t) - sizeof(uint32_t) - sizeof(uint32_t)];
+} Message;
+
+typedef struct {
+    spsc_queue_t *request_queue;
+    spsc_queue_t *response_queue;
+    int shm_fd_req;
+    int shm_fd_resp;
+    pid_t worker_pid;
+    uint32_t worker_id;
+} WorkerContext;
+
+typedef struct {
+    uint32_t num_workers;
+    WorkerContext workers[MAX_WORKERS];
+    uint32_t next_worker;  // Round-robin counter
+} WorkerPool;
+
+// Worker Pool Management
+WorkerPool* worker_pool_create(uint32_t num_workers, const char *module_name, 
+                              const char *app_name, const char *working_dir, 
+                              const char *venv_path, int is_asgi);
+void worker_pool_destroy(WorkerPool *pool);
+int worker_pool_send_request(WorkerPool *pool, Message *msg);
+int worker_pool_receive_response(WorkerPool *pool, uint32_t worker_id, Message *msg);
+
+// Message queue operations
+int enqueue_message(spsc_queue_t *q, const Message *msg);
+int dequeue_message(spsc_queue_t *q, Message *msg);
+
+// Worker process functions  
+void python_worker_main(uint32_t worker_id, const char *shm_req_name, 
+                       const char *shm_resp_name, const char *module_name,
+                       const char *app_name, const char *working_dir, 
+                       const char *venv_path, int is_asgi);
+
 // WSGI Protocol
 typedef struct WsgiApp WsgiApp;
 WsgiApp *WsgiApp_import(const char *, const char *, const char *, const char *);

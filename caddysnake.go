@@ -6,6 +6,7 @@ package caddysnake
 import "C"
 import (
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -115,6 +116,7 @@ type CaddySnake struct {
 	Lifespan   string `json:"lifespan,omitempty"`
 	WorkingDir string `json:"working_dir,omitempty"`
 	VenvPath   string `json:"venv_path,omitempty"`
+	Workers    int    `json:"workers,omitempty"`
 	logger     *zap.Logger
 	app        AppServer
 }
@@ -148,6 +150,16 @@ func (f *CaddySnake) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					if !d.Args(&f.VenvPath) {
 						return d.Errf("expected exactly one argument for venv")
 					}
+				case "workers":
+					var workersStr string
+					if !d.Args(&workersStr) {
+						return d.Errf("expected exactly one argument for workers")
+					}
+					workers, err := strconv.Atoi(workersStr)
+					if err != nil || workers < 1 || workers > 16 {
+						return d.Errf("workers must be an integer between 1 and 16")
+					}
+					f.Workers = workers
 				default:
 					return d.Errf("unknown subdirective: %s", d.Val())
 				}
@@ -170,23 +182,68 @@ func (CaddySnake) CaddyModule() caddy.ModuleInfo {
 // Provision sets up the module.
 func (f *CaddySnake) Provision(ctx caddy.Context) error {
 	f.logger = ctx.Logger(f)
+	
+	// Default to 1 worker if not specified
+	if f.Workers == 0 {
+		f.Workers = 1
+	}
+	
 	if f.ModuleWsgi != "" {
-		w, err := NewWsgi(f.ModuleWsgi, f.WorkingDir, f.VenvPath)
-		if err != nil {
-			return err
+		if f.Workers > 1 {
+			// Use process-based implementation for multiple workers
+			w, err := NewProcessWsgi(f.ModuleWsgi, f.WorkingDir, f.VenvPath, f.Workers)
+			if err != nil {
+				return err
+			}
+			f.logger.Info("imported process-based wsgi app", 
+				zap.String("module_wsgi", f.ModuleWsgi), 
+				zap.String("working_dir", f.WorkingDir), 
+				zap.String("venv_path", f.VenvPath),
+				zap.Int("workers", f.Workers))
+			f.app = w
+		} else {
+			// Use thread-based implementation for single worker (backward compatibility)
+			ensurePythonMainThread()
+			w, err := NewWsgi(f.ModuleWsgi, f.WorkingDir, f.VenvPath)
+			if err != nil {
+				return err
+			}
+			f.logger.Info("imported thread-based wsgi app", 
+				zap.String("module_wsgi", f.ModuleWsgi), 
+				zap.String("working_dir", f.WorkingDir), 
+				zap.String("venv_path", f.VenvPath))
+			f.app = w
 		}
+		
 		if f.Lifespan != "" {
 			f.logger.Warn("lifespan is only used in ASGI mode", zap.String("lifespan", f.Lifespan))
 		}
-		f.logger.Info("imported wsgi app", zap.String("module_wsgi", f.ModuleWsgi), zap.String("working_dir", f.WorkingDir), zap.String("venv_path", f.VenvPath))
-		f.app = w
 	} else if f.ModuleAsgi != "" {
-		var err error
-		f.app, err = NewAsgi(f.ModuleAsgi, f.WorkingDir, f.VenvPath, f.Lifespan == "on", f.logger)
-		if err != nil {
-			return err
+		if f.Workers > 1 {
+			// Use process-based implementation for multiple workers
+			var err error
+			f.app, err = NewProcessAsgi(f.ModuleAsgi, f.WorkingDir, f.VenvPath, f.Workers, f.Lifespan == "on", f.logger)
+			if err != nil {
+				return err
+			}
+			f.logger.Info("imported process-based asgi app", 
+				zap.String("module_asgi", f.ModuleAsgi), 
+				zap.String("working_dir", f.WorkingDir), 
+				zap.String("venv_path", f.VenvPath),
+				zap.Int("workers", f.Workers))
+		} else {
+			// Use thread-based implementation for single worker (backward compatibility)
+			ensurePythonMainThread()
+			var err error
+			f.app, err = NewAsgi(f.ModuleAsgi, f.WorkingDir, f.VenvPath, f.Lifespan == "on", f.logger)
+			if err != nil {
+				return err
+			}
+			f.logger.Info("imported thread-based asgi app", 
+				zap.String("module_asgi", f.ModuleAsgi), 
+				zap.String("working_dir", f.WorkingDir), 
+				zap.String("venv_path", f.VenvPath))
 		}
-		f.logger.Info("imported asgi app", zap.String("module_asgi", f.ModuleAsgi), zap.String("working_dir", f.WorkingDir), zap.String("venv_path", f.VenvPath))
 	} else {
 		return errors.New("asgi or wsgi app needs to be specified")
 	}
@@ -314,7 +371,7 @@ func initWsgi() {
 }
 
 func init() {
-	initPythonMainThread()
+	// Don't automatically initialize Python main thread - do it on demand
 	caddy.RegisterModule(CaddySnake{})
 	httpcaddyfile.RegisterHandlerDirective("python", parsePythonDirective)
 	initWsgi()
@@ -1267,4 +1324,352 @@ func asgi_cancel_request_websocket(requestID C.uint64_t, reason *C.char, code C.
 	if h != nil {
 		h.CancelWebsocket(reason, code)
 	}
+}
+
+// ProcessWsgi stores a reference to a worker pool for WSGI applications
+type ProcessWsgi struct {
+	pool        *C.WorkerPool
+	wsgiPattern string
+	workers     int
+}
+
+var processWsgiAppCache map[string]*ProcessWsgi = map[string]*ProcessWsgi{}
+
+// NewProcessWsgi creates a new process-based WSGI app
+func NewProcessWsgi(wsgiPattern, workingDir, venvPath string, workers int) (*ProcessWsgi, error) {
+	wsgiState.Lock()
+	defer wsgiState.Unlock()
+
+	cacheKey := fmt.Sprintf("%s:%d", wsgiPattern, workers)
+	if app, ok := processWsgiAppCache[cacheKey]; ok {
+		return app, nil
+	}
+
+	if workers <= 0 {
+		workers = 1
+	}
+
+	moduleApp := strings.Split(wsgiPattern, ":")
+	if len(moduleApp) != 2 {
+		return nil, errors.New("expected pattern $(MODULE_NAME):$(VARIABLE_NAME)")
+	}
+	moduleName := C.CString(moduleApp[0])
+	defer C.free(unsafe.Pointer(moduleName))
+	appName := C.CString(moduleApp[1])
+	defer C.free(unsafe.Pointer(appName))
+
+	var packagesPath *C.char = nil
+	if venvPath != "" {
+		sitePackagesPath, err := findSitePackagesInVenv(venvPath)
+		if err != nil {
+			return nil, err
+		}
+		packagesPath = C.CString(sitePackagesPath)
+		defer C.free(unsafe.Pointer(packagesPath))
+	}
+
+	var workingDirPath *C.char = nil
+	if workingDir != "" {
+		workingDirAbs, err := findWorkingDirectory(workingDir)
+		if err != nil {
+			return nil, err
+		}
+		workingDirPath = C.CString(workingDirAbs)
+		defer C.free(unsafe.Pointer(workingDirPath))
+	}
+
+	pool := C.worker_pool_create(C.uint32_t(workers), moduleName, appName, workingDirPath, packagesPath, 0)
+	if pool == nil {
+		return nil, errors.New("failed to create worker pool")
+	}
+
+	result := &ProcessWsgi{pool, wsgiPattern, workers}
+	processWsgiAppCache[cacheKey] = result
+	return result, nil
+}
+
+// Cleanup deallocates resources used by ProcessWsgi app
+func (m *ProcessWsgi) Cleanup() error {
+	if m.pool != nil {
+		wsgiState.Lock()
+		cacheKey := fmt.Sprintf("%s:%d", m.wsgiPattern, m.workers)
+		if _, ok := processWsgiAppCache[cacheKey]; !ok {
+			wsgiState.Unlock()
+			return nil
+		}
+		delete(processWsgiAppCache, cacheKey)
+		wsgiState.Unlock()
+
+		C.worker_pool_destroy(m.pool)
+	}
+	return nil
+}
+
+// HandleRequest passes request down to Python process via shared memory
+func (m *ProcessWsgi) HandleRequest(w http.ResponseWriter, r *http.Request) error {
+	requestHeaders := buildWsgiHeaders(r)
+	defer requestHeaders.Cleanup()
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+
+	// Serialize request data
+	requestData := map[string]interface{}{
+		"headers": make(map[string]string),
+		"body":    string(body),
+	}
+
+	// Convert headers to map
+	for i := 0; i < requestHeaders.Len(); i++ {
+		k, v := requestHeaders.Get(i)
+		requestData["headers"].(map[string]string)[k] = v
+	}
+
+	// Serialize to JSON
+	jsonData, err := json.Marshal(requestData)
+	if err != nil {
+		return err
+	}
+
+	// Create message
+	var msg C.Message
+	*(*C.MessageType)(unsafe.Pointer(&msg)) = C.MSG_TYPE_WSGI_REQUEST
+	msg.request_id = C.uint64_t(wsgiState.Request())
+	msg.data_size = C.uint32_t(len(jsonData))
+	
+	if len(jsonData) > len(msg.data) {
+		return errors.New("request data too large")
+	}
+	
+	copy((*[1048576]byte)(unsafe.Pointer(&msg.data[0]))[:len(jsonData)], jsonData)
+
+	// Send request to worker pool
+	workerID := C.worker_pool_send_request(m.pool, &msg)
+	if workerID < 0 {
+		return errors.New("failed to send request to worker")
+	}
+
+	// Wait for response
+	var response C.Message
+	if C.worker_pool_receive_response(m.pool, C.uint32_t(workerID), &response) != 0 {
+		return errors.New("failed to receive response from worker")
+	}
+
+	// Parse response
+	responseBytes := C.GoBytes(unsafe.Pointer(&response.data[0]), C.int(response.data_size))
+	var responseData map[string]interface{}
+	if err := json.Unmarshal(responseBytes, &responseData); err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte("Internal Server Error"))
+		return nil
+	}
+
+	// Write response
+	if statusCode, ok := responseData["status"].(float64); ok {
+		w.WriteHeader(int(statusCode))
+	} else {
+		w.WriteHeader(200)
+	}
+
+	if headers, ok := responseData["headers"].(map[string]interface{}); ok {
+		for k, v := range headers {
+			if vStr, ok := v.(string); ok {
+				w.Header().Add(k, vStr)
+			}
+		}
+	}
+
+	if body, ok := responseData["body"].(string); ok {
+		w.Write([]byte(body))
+	}
+
+	return nil
+}
+
+// ProcessAsgi stores a reference to a worker pool for ASGI applications
+type ProcessAsgi struct {
+	pool        *C.WorkerPool
+	asgiPattern string
+	workers     int
+	logger      *zap.Logger
+}
+
+var processAsgiAppCache map[string]*ProcessAsgi = map[string]*ProcessAsgi{}
+
+// NewProcessAsgi creates a new process-based ASGI app
+func NewProcessAsgi(asgiPattern, workingDir, venvPath string, workers int, lifespan bool, logger *zap.Logger) (*ProcessAsgi, error) {
+	shard := asgiState.shardFor(0)
+	shard.Lock()
+	defer shard.Unlock()
+
+	cacheKey := fmt.Sprintf("%s:%d", asgiPattern, workers)
+	if app, ok := processAsgiAppCache[cacheKey]; ok {
+		return app, nil
+	}
+
+	if workers <= 0 {
+		workers = 1
+	}
+
+	moduleApp := strings.Split(asgiPattern, ":")
+	if len(moduleApp) != 2 {
+		return nil, errors.New("expected pattern $(MODULE_NAME):$(VARIABLE_NAME)")
+	}
+	moduleName := C.CString(moduleApp[0])
+	defer C.free(unsafe.Pointer(moduleName))
+	appName := C.CString(moduleApp[1])
+	defer C.free(unsafe.Pointer(appName))
+
+	var packagesPath *C.char = nil
+	if venvPath != "" {
+		sitePackagesPath, err := findSitePackagesInVenv(venvPath)
+		if err != nil {
+			return nil, err
+		}
+		packagesPath = C.CString(sitePackagesPath)
+		defer C.free(unsafe.Pointer(packagesPath))
+	}
+
+	var workingDirPath *C.char = nil
+	if workingDir != "" {
+		workingDirAbs, err := findWorkingDirectory(workingDir)
+		if err != nil {
+			return nil, err
+		}
+		workingDirPath = C.CString(workingDirAbs)
+		defer C.free(unsafe.Pointer(workingDirPath))
+	}
+
+	pool := C.worker_pool_create(C.uint32_t(workers), moduleName, appName, workingDirPath, packagesPath, 1)
+	if pool == nil {
+		return nil, errors.New("failed to create worker pool")
+	}
+
+	result := &ProcessAsgi{pool, asgiPattern, workers, logger}
+	processAsgiAppCache[cacheKey] = result
+	return result, nil
+}
+
+// Cleanup deallocates resources used by ProcessAsgi app
+func (m *ProcessAsgi) Cleanup() error {
+	if m != nil && m.pool != nil {
+		shard := asgiState.shardFor(0)
+		shard.Lock()
+		cacheKey := fmt.Sprintf("%s:%d", m.asgiPattern, m.workers)
+		if _, ok := processAsgiAppCache[cacheKey]; !ok {
+			shard.Unlock()
+			return nil
+		}
+		delete(processAsgiAppCache, cacheKey)
+		shard.Unlock()
+
+		C.worker_pool_destroy(m.pool)
+	}
+	return nil
+}
+
+// HandleRequest passes request down to Python process via shared memory
+func (m *ProcessAsgi) HandleRequest(w http.ResponseWriter, r *http.Request) error {
+	host, port := getHostPort(r)
+	clientHost, clientPort := getRemoteHostPort(r)
+	websocket := needsWebsocketUpgrade(r)
+
+	requestHeaders, scope, err := buildAsgiHeaders(r, websocket)
+	if err != nil {
+		return err
+	}
+	defer requestHeaders.Cleanup()
+	defer scope.Cleanup()
+
+	// Serialize request data
+	requestData := map[string]interface{}{
+		"scope":       make(map[string]interface{}),
+		"headers":     make([][]string, 0),
+		"client":      []interface{}{clientHost, clientPort},
+		"server":      []interface{}{host, port},
+		"websocket":   websocket,
+	}
+
+	// Convert scope to map
+	scopeMap := requestData["scope"].(map[string]interface{})
+	for i := 0; i < scope.Len(); i++ {
+		k, v := scope.Get(i)
+		scopeMap[k] = v
+	}
+
+	// Convert headers to slice
+	headersList := requestData["headers"].([][]string)
+	for i := 0; i < requestHeaders.Len(); i++ {
+		k, v := requestHeaders.Get(i)
+		headersList = append(headersList, []string{k, v})
+	}
+	requestData["headers"] = headersList
+
+	// Serialize to JSON
+	jsonData, err := json.Marshal(requestData)
+	if err != nil {
+		return err
+	}
+
+	// Create message
+	var msg C.Message
+	*(*C.MessageType)(unsafe.Pointer(&msg)) = C.MSG_TYPE_ASGI_REQUEST
+	msg.request_id = C.uint64_t(atomic.AddUint64(&asgiState.requestCounter, 1))
+	msg.data_size = C.uint32_t(len(jsonData))
+	
+	if len(jsonData) > len(msg.data) {
+		return errors.New("request data too large")
+	}
+	
+	copy((*[1048576]byte)(unsafe.Pointer(&msg.data[0]))[:len(jsonData)], jsonData)
+
+	// Send request to worker pool
+	workerID := C.worker_pool_send_request(m.pool, &msg)
+	if workerID < 0 {
+		return errors.New("failed to send request to worker")
+	}
+
+	// Wait for response
+	var response C.Message
+	if C.worker_pool_receive_response(m.pool, C.uint32_t(workerID), &response) != 0 {
+		return errors.New("failed to receive response from worker")
+	}
+
+	// Parse response
+	responseBytes := C.GoBytes(unsafe.Pointer(&response.data[0]), C.int(response.data_size))
+	var responseData map[string]interface{}
+	if err := json.Unmarshal(responseBytes, &responseData); err != nil {
+		w.WriteHeader(500)
+		m.logger.Debug("Failed to parse response", zap.Error(err))
+		return nil
+	}
+
+	// Write response based on type
+	if responseType, ok := responseData["type"].(string); ok {
+		switch responseType {
+		case "http.response.start":
+			if statusCode, ok := responseData["status"].(float64); ok {
+				w.WriteHeader(int(statusCode))
+			}
+			if headers, ok := responseData["headers"].([]interface{}); ok {
+				for _, header := range headers {
+					if headerPair, ok := header.([]interface{}); ok && len(headerPair) == 2 {
+						if k, ok := headerPair[0].(string); ok {
+							if v, ok := headerPair[1].(string); ok {
+								w.Header().Add(k, v)
+							}
+						}
+					}
+				}
+			}
+		case "http.response.body":
+			if body, ok := responseData["body"].(string); ok {
+				w.Write([]byte(body))
+			}
+		}
+	}
+
+	return nil
 }

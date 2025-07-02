@@ -16,6 +16,7 @@ type PythonMainThread struct {
 var pythonMainThreadOnce = sync.Once{}
 var pythonMainThread *PythonMainThread = nil
 
+// initPythonMainThread initializes the thread-based Python worker for backward compatibility
 func initPythonMainThread() {
 	pythonMainThreadOnce.Do(func() {
 		pythonMainThread = &PythonMainThread{
@@ -44,4 +45,17 @@ func (p *PythonMainThread) do(f func()) {
 		done <- true
 	}
 	<-done
+}
+
+// isPythonMainThreadInitialized checks if the main thread is initialized
+func isPythonMainThreadInitialized() bool {
+	return pythonMainThread != nil
+}
+
+// ensurePythonMainThread initializes the main thread if not already done
+// This is used for backward compatibility when workers=1
+func ensurePythonMainThread() {
+	if !isPythonMainThreadInitialized() {
+		initPythonMainThread()
+	}
 }
